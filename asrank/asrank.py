@@ -122,61 +122,69 @@ class AsRank:
         else:
             raise ValueError("no datasets from ASRank available to use for tagging")
 
-    def _query_asrank_for_asns(self, asns):
-        assert all([isinstance(asn, str) for asn in asns])
-        asns = [asn for asn in asns if asn not in self.cache]
-        if not asns:
+    def _query_asrank_for_asns(self, asns, chunk_size=100):
+        asns = [str(asn) for asn in asns]
+        asns_needed = [asn for asn in asns if asn not in self.cache]
+        if not asns_needed:
             return
 
-        graphql_query = """
-            {
-              asns(asns: %s, dateStart: "%s", dateEnd: "%s", first:%d, sort:"-date") {
-                edges {
-                  node {
-                    date
-                    asn
-                    asnName
-                    rank
-                    organization{
-                      country{
-                        iso
-                        name
+        # https://stackoverflow.com/a/312464/768793
+        def chunks(lst, n):
+            """Yield successive n-sized chunks from lst."""
+            for i in range(0, len(lst), n):
+                yield lst[i:i + n]
+
+        for asns in chunks(asns_needed, chunk_size):
+
+            graphql_query = """
+                {
+                  asns(asns: %s, dateStart: "%s", dateEnd: "%s", first:%d, sort:"-date") {
+                    edges {
+                      node {
+                        date
+                        asn
+                        asnName
+                        rank
+                        organization{
+                          country{
+                            iso
+                            name
+                          }
+                          orgName
+                          orgId
+                        } asnDegree {
+                          provider
+                          peer
+                          customer
+                          total
+                          transit
+                          sibling
+                        }
                       }
-                      orgName
-                      orgId
-                    } asnDegree {
-                      provider
-                      peer
-                      customer
-                      total
-                      transit
-                      sibling
                     }
                   }
                 }
-              }
-            }
-        """ % (json.dumps(asns), self.data_ts, self.data_ts, len(asns))
-        r = self._send_request(graphql_query)
-        try:
-            for node in r.json()['data']['asns']['edges']:
-                data = node['node']
-                if data['asn'] not in self.cache:
-                    if "asnDegree" in data:
-                        degree = data["asnDegree"]
-                        degree["provider"] = degree["provider"] or 0
-                        degree["customer"] = degree["customer"] or 0
-                        degree["peer"] = degree["peer"] or 0
-                        degree["sibling"] = degree["sibling"] or 0
-                        data["asnDegree"] = degree
-                    self.cache[data['asn']] = data
-            for asn in asns:
-                if asn not in self.cache:
-                    self.cache[asn] = None
-        except KeyError as e:
-            logging.error("Error in node: {}".format(r.json()))
-            logging.error("Request: {}".format(graphql_query))
-            raise e
+            """ % (json.dumps(asns), self.data_ts, self.data_ts, len(asns))
+            r = self._send_request(graphql_query)
+            try:
+                for node in r.json()['data']['asns']['edges']:
+                    data = node['node']
+                    if data['asn'] not in self.cache:
+                        if "asnDegree" in data:
+                            degree = data["asnDegree"]
+                            degree["provider"] = degree["provider"] or 0
+                            degree["customer"] = degree["customer"] or 0
+                            degree["peer"] = degree["peer"] or 0
+                            degree["sibling"] = degree["sibling"] or 0
+                            data["asnDegree"] = degree
+                        self.cache[data['asn']] = data
+                for asn in asns:
+                    if asn not in self.cache:
+                        self.cache[asn] = None
+            except KeyError as e:
+                logging.error("Error in node: {}".format(r.json()))
+                logging.error("Request: {}".format(graphql_query))
+                raise e
 
     ##########
     # AS_ORG #
@@ -351,10 +359,28 @@ class AsRank:
         self.cone_cache[asn1] = asns_in_cone
         return asn0 in asns_in_cone
 
-    def get_all_siblings(self, asn):
+    def cache_asrank_chunk(self, asns: list, chunk_size: int):
+        """
+        Query asrank info in chunk to boost individual asrank queries performance later.
+
+        :param asns:
+        :param chunk_size:
+        :return:
+        """
+        self._query_asrank_for_asns(asns, chunk_size)
+
+    def get_all_siblings_list(self, asns, chunk_size=100):
+        self._query_asrank_for_asns(asns, chunk_size)
+        res = {}
+        for asn in asns:
+            res[asn] = self.get_all_siblings(asn)
+        return res
+
+    def get_all_siblings(self, asn, skip_asrank_call=False):
         """
         get all siblings for an ASN
-        :param asn:
+        :param asn: AS number to query for all siblings
+        :param skip_asrank_call: skip asrank call if already done
         :return: a tuple of (TOTAL_COUNT, ASNs)
         """
         # FIXME: pagination does not work here. Example ASN5313.
@@ -362,9 +388,15 @@ class AsRank:
         if asn in self.siblings_cache:
             return self.siblings_cache[asn]
 
-        self._query_asrank_for_asns([asn])
+        if not skip_asrank_call:
+            self._query_asrank_for_asns([asn])
+
         if asn not in self.cache or self.cache[asn] is None:
             return 0, []
+        asrank_info = self.cache[asn]
+        if "organization" not in asrank_info or asrank_info["organization"] is None:
+            return 0, []
+
         org_id = self.cache[asn]["organization"]["orgId"]
 
         if org_id in self.organization_cache:
@@ -392,9 +424,9 @@ class AsRank:
         total_cnt = data["members"]["asns"]["totalCount"]
         siblings = set()
         for sibling_data in data["members"]["asns"]["edges"]:
-            siblings.add(int(sibling_data["node"]["asn"]))
-        if int(asn) in siblings:
-            siblings.remove(int(asn))
+            siblings.add(sibling_data["node"]["asn"])
+        if asn in siblings:
+            siblings.remove(asn)
             total_cnt -= 1
 
         # NOTE: this assert can be wrong when number of siblings needs pagination

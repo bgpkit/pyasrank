@@ -98,3 +98,16 @@ class TestAsRank(unittest.TestCase):
         self.assertEqual(34, total)
         total, siblings = self.asrank.get_all_siblings("15169")
         self.assertEqual(8, total)
+
+    def test_preload_asrank(self):
+        asns = ["524", "10753", 3356]
+        self.asrank.cache_asrank_chunk(asns, 100)
+        for asn in asns:
+            self.asrank.get_all_siblings(asn, skip_asrank_call=True)
+
+
+    def test_asrank_get_all_siblings_list(self):
+        data_map = self.asrank.get_all_siblings_list(["3356", "15169"])
+
+        self.assertEqual(34, data_map["3356"][0])
+        self.assertEqual(8, data_map["15169"][0])
